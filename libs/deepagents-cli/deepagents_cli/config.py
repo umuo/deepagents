@@ -155,6 +155,9 @@ class Settings:
     google_api_key: str | None
     tavily_api_key: str | None
 
+    # OpenAI configuration
+    openai_base_url: str | None
+
     # Google Cloud configuration (for VertexAI)
     google_cloud_project: str | None
 
@@ -186,6 +189,9 @@ class Settings:
         tavily_key = os.environ.get("TAVILY_API_KEY")
         google_cloud_project = os.environ.get("GOOGLE_CLOUD_PROJECT")
 
+        # OpenAI configuration
+        openai_base_url = os.environ.get("OPENAI_BASE_URL")
+
         # Detect LangSmith configuration
         # DEEPAGENTS_LANGSMITH_PROJECT: Project for deepagents agent tracing
         # user_langchain_project: User's ORIGINAL LANGSMITH_PROJECT (before override)
@@ -202,6 +208,7 @@ class Settings:
             anthropic_api_key=anthropic_key,
             google_api_key=google_key,
             tavily_api_key=tavily_key,
+            openai_base_url=openai_base_url,
             google_cloud_project=google_cloud_project,
             deepagents_langchain_project=deepagents_langchain_project,
             user_langchain_project=user_langchain_project,
@@ -535,7 +542,11 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
     if provider == "openai":
         from langchain_openai import ChatOpenAI
 
-        return ChatOpenAI(model=model_name)
+        # Support custom base URL for OpenAI-compatible APIs (e.g., proxies, third-party services)
+        return ChatOpenAI(
+            model=model_name,
+            base_url=settings.openai_base_url,  # None uses default OpenAI URL
+        )
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
