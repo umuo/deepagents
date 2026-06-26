@@ -1,48 +1,50 @@
-"""Middleware for async subagents running on remote LangGraph servers.
+"""Middleware for async subagents running on remote Agent Protocol servers.
 
 Async subagents use the LangGraph SDK to launch background runs on remote
-LangGraph deployments. Unlike synchronous subagents (which block until
-completion), async subagents return a task ID immediately, allowing the main
-agent to monitor progress and send updates while the subagent works.
-"""
+[Agent Protocol](https://github.com/langchain-ai/agent-protocol) servers.
+Unlike synchronous subagents (which block until completion), async subagents
+return a task ID immediately, allowing the main agent to monitor progress and
+send updates while the subagent works.
 
-from __future__ import annotations
+Compatible with LangGraph Platform (managed) and self-hosted servers.
+"""
 
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Annotated, Any, Literal, NotRequired, TypedDict
+from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
-from langchain.agents.middleware.types import AgentMiddleware, AgentState, ContextT, ModelResponse, ResponseT
-from langchain.tools import ToolRuntime  # noqa: TC002
+from langchain.agents.middleware.types import AgentMiddleware, AgentState, ContextT, ModelRequest, ModelResponse, ResponseT
+from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.types import Command
 from langgraph_sdk import get_client, get_sync_client
+from langgraph_sdk.client import LangGraphClient, SyncLangGraphClient
+from langgraph_sdk.schema import Run
 from pydantic import BaseModel, Field
 
 from deepagents.middleware._utils import append_to_system_message
 
 logger = logging.getLogger(__name__)
 
-if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
-
-    from langchain.agents.middleware.types import ModelRequest
-    from langgraph_sdk.client import LangGraphClient, SyncLangGraphClient
-    from langgraph_sdk.schema import Run
-
 
 class AsyncSubAgent(TypedDict):
-    """Specification for an async subagent running on a remote LangGraph server.
+    """Specification for an async subagent running on a remote [Agent Protocol](https://github.com/langchain-ai/agent-protocol) server.
 
-    Async subagents connect to LangGraph deployments via the LangGraph SDK.
-    They run as background tasks that the main agent can monitor and update.
+    Async subagents connect to any Agent Protocol-compliant server via the
+    LangGraph SDK. They run as background tasks that the main agent can
+    monitor and update.
 
-    Authentication is handled via environment variables (`LANGGRAPH_API_KEY`,
-    `LANGSMITH_API_KEY`, or `LANGCHAIN_API_KEY`), which the LangGraph SDK
-    reads automatically.
+    Compatible with LangGraph Platform / LangSmith Deployment (managed) and
+    self-hosted servers.
+
+    Authentication for LangGraph Platform / LangSmith Deployment is handled
+    automatically by the SDK via environment variables (`LANGGRAPH_API_KEY`,
+    `LANGSMITH_API_KEY`, or `LANGCHAIN_API_KEY`). For self-hosted servers,
+    pass custom auth via `headers`.
     """
 
     name: str
@@ -58,9 +60,10 @@ class AsyncSubAgent(TypedDict):
     """The graph name or assistant ID on the remote server."""
 
     url: NotRequired[str]
-    """URL of the LangGraph server (e.g., `"https://my-deployment.langsmith.dev"`).
+    """URL of the [Agent Protocol](https://github.com/langchain-ai/agent-protocol) server.
 
-    Omit to use ASGI transport for local LangGraph servers.
+    Defaults to the LangGraph SDK's default endpoint. Omit to use ASGI
+    transport for local servers.
     """
 
     headers: NotRequired[dict[str, str]]
@@ -77,10 +80,10 @@ class AsyncTask(TypedDict):
     """Name of the async subagent type that is running."""
 
     thread_id: str
-    """LangGraph thread ID for the remote run."""
+    """Thread ID on the remote server."""
 
     run_id: str
-    """LangGraph run ID for the current execution on the thread."""
+    """Run ID for the current execution on the thread."""
 
     status: str
     """Current task status (e.g., `'running'`, `'success'`, `'error'`, `'cancelled'`).
@@ -103,7 +106,7 @@ class AsyncTask(TypedDict):
     """
 
     last_updated_at: str
-    """ISO-8601 timestamp (UTC) when the task was last updated with a new message.
+    """ISO-8601 timestamp (UTC) when the task status changes or when a follow-up message is sent via the update tool.
 
     Format: `YYYY-MM-DDTHH:MM:SSZ` (e.g., `2024-01-15T10:30:00Z`).
     """
@@ -160,7 +163,7 @@ class ListAsyncTasksSchema(BaseModel):
     )
 
 
-ASYNC_TASK_TOOL_DESCRIPTION = """Start an async subagent on a remote LangGraph server. The subagent runs in the background and returns a task ID immediately.
+ASYNC_TASK_TOOL_DESCRIPTION = """Start an async subagent on a remote server. The subagent runs in the background and returns a task ID immediately.
 
 Available async agent types:
 {available_agents}
@@ -170,20 +173,22 @@ Available async agent types:
 2. Use `check_async_task` only when the user asks for a status update or result.
 3. Use `update_async_task` to send new instructions to a running task.
 4. Multiple async subagents can run concurrently — launch several and let them run in the background.
-5. The subagent runs on a remote LangGraph server, so it has its own tools and capabilities."""  # noqa: E501
+5. The subagent runs on a remote server, so it has its own tools and capabilities."""  # noqa: E501
 
 ASYNC_TASK_SYSTEM_PROMPT = """## Async subagents (remote LangGraph servers)
 
 You have access to async subagent tools that launch background tasks on remote LangGraph servers.
 
-### Tools:
+### Tools
+
 - `start_async_task`: Start a new background task. Returns a task ID immediately.
 - `check_async_task`: Get current status and result of a task. Returns status + result (if complete).
 - `update_async_task`: Send new instructions to a running task. Returns confirmation + updated status.
 - `cancel_async_task`: Stop a running task. Returns confirmation.
 - `list_async_tasks`: List all tracked tasks with live statuses. Returns summary of all tasks.
 
-### Workflow:
+### Workflow
+
 1. **Start** — Use `start_async_task` to start a task. Report the task ID to the user and stop.
    Do NOT immediately check the status — the task runs in the background while you and the user continue other work.
 2. **Check (on request)** — Only use `check_async_task` when the user explicitly asks for a status update or
@@ -194,7 +199,8 @@ You have access to async subagent tools that launch background tasks on remote L
 5. **Collect** — When `check_async_task` returns status "success", the result is included in the response.
 6. **List** — Use `list_async_tasks` to see live statuses for all tasks at once, or to recall task IDs after context compaction.
 
-### Critical rules:
+### Critical rules
+
 - After launching, ALWAYS return control to the user immediately. Never auto-check after launching.
 - Never poll `check_async_task` in a loop. Check once per user request, then stop.
 - If a check returns "running", tell the user and wait for them to ask again.
@@ -204,14 +210,20 @@ You have access to async subagent tools that launch background tasks on remote L
   use `check_async_task` when the user asks about a specific task.
 - Always show the full task_id — never truncate or abbreviate it.
 
-### When to use async subagents:
+### When to use async subagents
+
 - Long-running tasks that would block the main agent
 - Tasks that benefit from running on specialized remote deployments
 - When you want to run multiple tasks concurrently and collect results later"""
 
 
 def _resolve_headers(spec: AsyncSubAgent) -> dict[str, str]:
-    """Build headers for a remote LangGraph server, including auth scheme."""
+    """Build headers for a remote Agent Protocol server.
+
+    Adds `x-auth-scheme: langsmith` by default unless already provided.
+    For self-hosted servers that don't require this header, it is typically
+    ignored. Override via the `headers` field on the `AsyncSubAgent` config.
+    """
     headers: dict[str, str] = dict(spec.get("headers") or {})
     if "x-auth-scheme" not in headers:
         headers["x-auth-scheme"] = "langsmith"
@@ -219,7 +231,7 @@ def _resolve_headers(spec: AsyncSubAgent) -> dict[str, str]:
 
 
 class _ClientCache:
-    """Lazily-created, cached LangGraph SDK clients keyed by (url, headers)."""
+    """Lazily-created, cached Agent Protocol clients keyed by (url, headers)."""
 
     def __init__(self, agents: dict[str, AsyncSubAgent]) -> None:
         self._agents = agents
@@ -391,6 +403,7 @@ def _build_check_command(
 ) -> Command:
     """Build the `Command` update for a check result."""
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    last_updated_at = now if task["status"] != result["status"] else task["last_updated_at"]
     updated_task = AsyncTask(
         task_id=task["task_id"],
         agent_name=task["agent_name"],
@@ -399,7 +412,7 @@ def _build_check_command(
         status=result["status"],
         created_at=task["created_at"],
         last_checked_at=now,
-        last_updated_at=task["last_updated_at"],
+        last_updated_at=last_updated_at,
     )
     return Command(
         update={
@@ -621,7 +634,7 @@ def _build_cancel_tool(
             status="cancelled",
             created_at=tracked["created_at"],
             last_checked_at=now,
-            last_updated_at=tracked["last_updated_at"],
+            last_updated_at=now,
         )
         msg = f"Cancelled async subagent task: {tracked['task_id']}"
         return Command(
@@ -653,7 +666,7 @@ def _build_cancel_tool(
             status="cancelled",
             created_at=tracked["created_at"],
             last_checked_at=now,
-            last_updated_at=tracked["last_updated_at"],
+            last_updated_at=now,
         )
         msg = f"Cancelled async subagent task: {tracked['task_id']}"
         return Command(
@@ -760,6 +773,7 @@ def _build_list_tasks_tool(clients: _ClientCache) -> StructuredTool:
         for task in filtered:
             status = _fetch_live_status(clients, task)
             entries.append(_format_task_entry(task, status))
+            last_updated_at = now if status != task["status"] else task["last_updated_at"]
             updated_tasks[task["task_id"]] = AsyncTask(
                 task_id=task["task_id"],
                 agent_name=task["agent_name"],
@@ -768,7 +782,7 @@ def _build_list_tasks_tool(clients: _ClientCache) -> StructuredTool:
                 status=status,
                 created_at=task["created_at"],
                 last_checked_at=now,
-                last_updated_at=task["last_updated_at"],
+                last_updated_at=last_updated_at,
             )
         msg = f"{len(entries)} tracked task(s):\n" + "\n".join(entries)
         return Command(
@@ -792,6 +806,7 @@ def _build_list_tasks_tool(clients: _ClientCache) -> StructuredTool:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         for task, status in zip(filtered, statuses, strict=True):
             entries.append(_format_task_entry(task, status))
+            last_updated_at = now if status != task["status"] else task["last_updated_at"]
             updated_tasks[task["task_id"]] = AsyncTask(
                 task_id=task["task_id"],
                 agent_name=task["agent_name"],
@@ -800,7 +815,7 @@ def _build_list_tasks_tool(clients: _ClientCache) -> StructuredTool:
                 status=status,
                 created_at=task["created_at"],
                 last_checked_at=now,
-                last_updated_at=task["last_updated_at"],
+                last_updated_at=last_updated_at,
             )
         msg = f"{len(entries)} tracked task(s):\n" + "\n".join(entries)
         return Command(
@@ -834,7 +849,7 @@ def _build_async_subagent_tools(
         agents: List of async subagent specifications.
 
     Returns:
-        List of StructuredTools for launch, check, update, cancel, and list operations.
+        List of `StructuredTools` for launch, check, update, cancel, and list operations.
     """
     agent_map: dict[str, AsyncSubAgent] = {a["name"]: a for a in agents}
     clients = _ClientCache(agent_map)
@@ -851,12 +866,16 @@ def _build_async_subagent_tools(
 
 
 class AsyncSubAgentMiddleware(AgentMiddleware[Any, ContextT, ResponseT]):
-    """Middleware for async subagents running on remote LangGraph servers.
+    """Middleware for async subagents running on remote Agent Protocol servers.
 
     This middleware adds tools for launching, monitoring, and updating
-    background tasks on remote LangGraph deployments. Unlike the synchronous
+    background tasks on remote Agent Protocol servers. Unlike the synchronous
     `SubAgentMiddleware`, async subagents return immediately with a task ID,
     allowing the main agent to continue working while subagents execute.
+
+    Works with any Agent Protocol-compliant server — LangGraph Platform
+    (managed) or self-hosted (e.g. a FastAPI server implementing the Agent
+    Protocol spec).
 
     Task IDs are persisted in the agent state under `async_tasks` so they
     survive context compaction/offloading and can be accessed programmatically.
@@ -865,8 +884,7 @@ class AsyncSubAgentMiddleware(AgentMiddleware[Any, ContextT, ResponseT]):
         async_subagents: List of async subagent specifications.
 
             Each must include `name`, `description`, and `graph_id`. `url` is
-            optional — omit it to use ASGI transport for local
-            LangGraph servers.
+            optional — omit it to use ASGI transport for local servers.
         system_prompt: Instructions appended to the main agent's system prompt
             about how to use the async subagent tools.
 
@@ -911,7 +929,7 @@ class AsyncSubAgentMiddleware(AgentMiddleware[Any, ContextT, ResponseT]):
 
         if system_prompt:
             agents_desc = "\n".join(f"- {a['name']}: {a['description']}" for a in async_subagents)
-            self.system_prompt: str | None = system_prompt + "\n\nAvailable async subagent types:\n" + agents_desc
+            self.system_prompt: str | None = system_prompt + "\n\nAvailable async subagent types:\n\n" + agents_desc
         else:
             self.system_prompt = system_prompt
 

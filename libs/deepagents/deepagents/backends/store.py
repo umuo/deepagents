@@ -1,21 +1,20 @@
-"""StoreBackend: Adapter for LangGraph's BaseStore (persistent, cross-thread)."""
+"""`StoreBackend`: Adapter for LangGraph's BaseStore (persistent, cross-thread)."""
 
 import base64
 import re
-import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Generic
+from typing import TYPE_CHECKING, Any, Generic, cast
 
-from langgraph.config import get_config
-
-if TYPE_CHECKING:
-    from langchain.tools import ToolRuntime
-from langgraph.store.base import BaseStore, Item
+from langgraph.config import get_config, get_store
+from langgraph.runtime import get_runtime
+from langgraph.store.base import BaseStore, Item, PutOp
 from langgraph.typing import ContextT, StateT
 
+from deepagents._api.deprecation import deprecated, warn_deprecated
 from deepagents.backends.protocol import (
     BackendProtocol,
+    DeleteResult,
     EditResult,
     FileData,
     FileDownloadResponse,
@@ -41,20 +40,89 @@ from deepagents.backends.utils import (
 )
 
 if TYPE_CHECKING:
-    from langchain.tools import ToolRuntime
     from langgraph.runtime import Runtime
 
 
+@deprecated(
+    since="0.5.0",
+    removal="0.7.0",
+    message=(
+        "`BackendContext` is deprecated and will be removed in "
+        "deepagents==0.7.0. Namespace factories now receive a `Runtime` "
+        "instance directly — migrate "
+        '`lambda ctx: (ctx.runtime.context.user_id, "fs")` '
+        'to `lambda rt: (rt.server_info.user.identity, "fs")`.'
+    ),
+    package="deepagents",
+)
 @dataclass
 class BackendContext(Generic[StateT, ContextT]):
-    """Context passed to namespace factory functions."""
+    """Context passed to namespace factory functions.
+
+    !!! warning "Deprecated"
+
+        `BackendContext` will be removed in `deepagents==0.7.0`. Namespace
+        factories now receive a `Runtime` instance directly. Migrate
+        `lambda ctx: (ctx.runtime.context.user_id, "fs")` to
+        `lambda rt: (rt.server_info.user.identity, "fs")`.
+    """
 
     state: StateT
     runtime: "Runtime[ContextT]"
 
 
-# Type alias for namespace factory functions
-NamespaceFactory = Callable[[BackendContext[Any, Any]], tuple[str, ...]]
+class _NamespaceRuntimeCompat:
+    """Wrapper that duck-types as both `Runtime` and `BackendContext`.
+
+    Allows old-style namespace factories (accessing `.runtime` / `.state`)
+    to work alongside new-style factories (accessing `Runtime` attrs directly).
+
+    Will be removed in `deepagents==0.7.0`.
+    """
+
+    def __init__(self, runtime: "Runtime[Any] | None", state: object = None) -> None:
+        self._runtime = runtime
+        self._state = state
+
+    @property
+    @deprecated(
+        since="0.5.0",
+        removal="0.7.0",
+        message=(
+            "Accessing `.runtime` on the namespace factory argument is "
+            "deprecated and will be removed in deepagents==0.7.0. The "
+            "argument is now a Runtime instance — use its attributes directly "
+            "(e.g. `rt.context` instead of `ctx.runtime.context`)."
+        ),
+        package="deepagents",
+    )
+    def runtime(self) -> "Runtime[Any] | None":
+        return self._runtime
+
+    @property
+    @deprecated(
+        since="0.5.0",
+        removal="0.7.0",
+        message=(
+            "Accessing `.state` on the namespace factory argument is "
+            "deprecated and will be removed in deepagents==0.7.0. Namespace "
+            "resolution should not depend on state."
+        ),
+        package="deepagents",
+    )
+    def state(self) -> object:
+        return self._state
+
+    def __getattr__(self, name: str) -> object:
+        if self._runtime is None:
+            msg = f"Runtime is not available (running outside graph execution), cannot access '.{name}'"
+            raise AttributeError(msg)
+        return getattr(self._runtime, name)
+
+
+# Type alias for namespace factory functions. See `_NamespaceRuntimeCompat`
+# for the legacy-callable shim.
+NamespaceFactory = Callable[["Runtime[Any]"], tuple[str, ...]]
 
 # Allowed characters in namespace components: alphanumeric, plus characters
 # common in user IDs (hyphen, underscore, dot, @, +, colon, tilde).
@@ -68,7 +136,7 @@ def _validate_namespace(namespace: tuple[str, ...]) -> tuple[str, ...]:
     alphanumeric (a-z, A-Z, 0-9), hyphen (-), underscore (_), dot (.),
     at sign (@), plus (+), colon (:), and tilde (~).
 
-    Characters like ``*``, ``?``, ``[``, ``]``, ``{``, ``}``, etc. are
+    Characters like `*`, `?`, `[`, `]`, `{`, `}`, etc. are
     rejected to prevent wildcard or glob injection in store lookups.
 
     Args:
@@ -113,96 +181,115 @@ class StoreBackend(BackendProtocol):
 
     def __init__(
         self,
-        runtime: "ToolRuntime",
+        runtime: object = None,
         *,
+        store: BaseStore | None = None,
         namespace: NamespaceFactory | None = None,
         file_format: FileFormat = "v2",
     ) -> None:
-        r"""Initialize StoreBackend with runtime.
+        r"""Initialize `StoreBackend`.
 
         Args:
-            runtime: The ToolRuntime instance providing store access and configuration.
-            namespace: Optional callable that takes a BackendContext and returns
-                a namespace tuple. This provides full flexibility for namespace resolution.
-                We forbid * which is a wild card for now.
-                If None, uses legacy assistant_id detection from metadata (deprecated).
+            runtime: Deprecated - accepted for backward compatibility but
+                ignored. Store and context are now obtained via
+                `get_store()` / `get_runtime()`.
+            store: Optional `BaseStore` instance. When provided, this store
+                is used directly. When `None` (the default), the store is
+                obtained at call time via `get_store()`, which requires
+                a LangGraph graph execution context.
+            namespace: Optional callable that receives a `Runtime` and returns
+                a namespace tuple for scoping store operations.
+                Wildcards (`*`) are forbidden.
+                If `None`, uses legacy assistant_id detection from metadata (deprecated).
 
-                !!! Note:
-                    This parameter will be **required** in version 0.5.0.
-                !!!! Warning:
-                    This API is subject to change in a minor version.
+                Old-style callables that accept `BackendContext` still work
+                but are deprecated and will be removed in `deepagents==0.7.0`.
 
             file_format: Storage format version. `"v1"` (default) stores
                 content as `list[str]` (lines split on `\\n`) without an
-                `encoding` field.  `"v2"` stores content as a plain `str`
+                `encoding` field. `"v2"` stores content as a plain `str`
                 with an `encoding` field.
 
         Example:
-                    namespace=lambda ctx: ("filesystem", ctx.runtime.context.user_id)
+            `namespace=lambda rt: (rt.server_info.user.identity, "filesystem")`
         """
-        self.runtime = runtime
+        if runtime is not None:
+            warn_deprecated(
+                since="0.5.0",
+                removal="0.7.0",
+                message=(
+                    "Passing `runtime` to `StoreBackend` is deprecated and "
+                    "will be removed in deepagents==0.7.0. `StoreBackend` "
+                    "now obtains store and context via "
+                    "`get_store()` / `get_runtime()`. Use `StoreBackend()` or "
+                    "`StoreBackend(store=my_store)` instead."
+                ),
+                package="deepagents",
+            )
+        self._store = store
         self._namespace = namespace
         self._file_format = file_format
 
     def _get_store(self) -> BaseStore:
-        """Get the store instance.
+        """Return the store instance.
 
-        Returns:
-            BaseStore instance from the runtime.
-
-        Raises:
-            ValueError: If no store is available in the runtime.
+        Uses the store passed at init if available, otherwise falls back to
+        `get_store()` which reads from the LangGraph execution context.
         """
-        store = self.runtime.store
-        if store is None:
-            msg = "Store is required but not available in runtime"
-            raise ValueError(msg)
-        return store
+        if self._store is not None:
+            return self._store
+        try:
+            return get_store()
+        except (RuntimeError, KeyError):
+            msg = (
+                "StoreBackend must be used inside a LangGraph graph execution "
+                "(e.g. via create_deep_agent), or initialized with an explicit "
+                "store: StoreBackend(store=my_store)"
+            )
+            raise RuntimeError(msg) from None
 
     def _get_namespace(self) -> tuple[str, ...]:
         """Get the namespace for store operations.
 
-        If namespace was provided at init, calls it with a BackendContext.
+        If namespace was provided at init, calls it with a `_NamespaceRuntimeCompat`
+        wrapper that duck-types as both `Runtime` (new) and `BackendContext` (legacy).
         Otherwise, uses legacy assistant_id detection from metadata (deprecated).
         """
         if self._namespace is not None:
-            state = getattr(self.runtime, "state", None)
-            ctx = BackendContext(state=state, runtime=self.runtime)  # ty: ignore[invalid-argument-type]
-            return _validate_namespace(self._namespace(ctx))
+            try:
+                runtime = get_runtime()
+            except (RuntimeError, KeyError):
+                runtime = None
+            # `_NamespaceRuntimeCompat` deliberately duck-types `Runtime` for
+            # legacy factories; cast because `Runtime` itself is not structural.
+            compat = cast("Runtime[Any]", _NamespaceRuntimeCompat(runtime))
+            return _validate_namespace(self._namespace(compat))
 
         return self._get_namespace_legacy()
 
     def _get_namespace_legacy(self) -> tuple[str, ...]:
         """Legacy namespace resolution: check metadata for assistant_id.
 
-        Preference order:
-        1) Use `self.runtime.config` if present (tests pass this explicitly).
-        2) Fallback to `langgraph.config.get_config()` if available.
-        3) Default to ("filesystem",).
+        Uses `get_config()` to find `assistant_id` in metadata. Returns
+        `(assistant_id, "filesystem")` when present; otherwise returns
+        `("filesystem",)`.
 
-        If an assistant_id is available in the config metadata, return
-        (assistant_id, "filesystem") to provide per-assistant isolation.
+        !!! deprecated
 
-        .. deprecated::
-            Pass `namespace` to StoreBackend instead of relying on legacy detection.
+            Pass `namespace` to `StoreBackend` instead of relying on legacy detection.
         """
-        warnings.warn(
-            "StoreBackend without explicit `namespace` is deprecated. Pass `namespace=lambda ctx: (...)` to StoreBackend.",
-            DeprecationWarning,
-            stacklevel=3,
+        warn_deprecated(
+            since="0.5.0",
+            removal="0.7.0",
+            message=(
+                "`StoreBackend` without an explicit `namespace` is deprecated "
+                "and will be removed in deepagents==0.7.0. Pass "
+                "`namespace=lambda ctx: (...)` to `StoreBackend`."
+            ),
+            package="deepagents",
         )
         namespace = "filesystem"
 
-        # Prefer the runtime-provided config when present
-        runtime_cfg = getattr(self.runtime, "config", None)
-        if isinstance(runtime_cfg, dict):
-            assistant_id = runtime_cfg.get("metadata", {}).get("assistant_id")
-            if assistant_id:
-                return (assistant_id, namespace)
-            return (namespace,)
-
-        # Fallback to langgraph's context, but guard against errors when
-        # called outside of a runnable context
         try:
             cfg = get_config()
         except Exception:  # noqa: BLE001  # Intentional for resilient config fallback
@@ -214,18 +301,19 @@ class StoreBackend(BackendProtocol):
             assistant_id = None
 
         if assistant_id:
-            return (assistant_id, namespace)
+            return _validate_namespace((assistant_id, namespace))
         return (namespace,)
 
     def _convert_store_item_to_file_data(self, store_item: Item) -> FileData:
-        """Convert a store Item to FileData format.
+        """Convert a store `Item` to `FileData` format.
 
         Args:
-            store_item: The store Item containing file data.
+            store_item: The store `Item` containing file data.
 
         Returns:
-            FileData dict with content and encoding. Includes created_at and
-            modified_at when present in the store item.
+            `FileData` dict with content and encoding.
+
+                Includes `created_at` and `modified_at` when present in the store item.
         """
         raw_content = store_item.value.get("content")
         if raw_content is None:
@@ -234,10 +322,15 @@ class StoreBackend(BackendProtocol):
 
         # BACKWARDS COMPAT: legacy list[str] format
         if isinstance(raw_content, list):
-            warnings.warn(
-                "Store item with list[str] content is deprecated. Content should be stored as a plain str.",
-                DeprecationWarning,
-                stacklevel=2,
+            warn_deprecated(
+                since="0.5.0",
+                removal="0.7.0",
+                message=(
+                    "Store item with `list[str]` content is deprecated and "
+                    "will be removed in deepagents==0.7.0. Content should "
+                    "be stored as a plain `str`."
+                ),
+                package="deepagents",
             )
             content = "\n".join(raw_content)
         elif isinstance(raw_content, str):
@@ -257,17 +350,19 @@ class StoreBackend(BackendProtocol):
         return result
 
     def _convert_file_data_to_store_value(self, file_data: FileData) -> dict[str, Any]:
-        """Convert FileData to a dict suitable for store.put().
+        """Convert `FileData` to a dict suitable for `store.put()`.
 
         When `file_format="v1"`, returns the legacy format with `content`
         as `list[str]` and no `encoding` key.
 
         Args:
-            file_data: The FileData to convert.
+            file_data: The `FileData` to convert.
 
         Returns:
-            Dictionary with content and encoding. Includes created_at and
-            modified_at when present in the FileData.
+            Dictionary with content and encoding.
+
+                Includes `created_at` and `modified_at` when present in
+                the `FileData`.
         """
         if self._file_format == "v1":
             return _to_legacy_file_data(file_data)
@@ -297,7 +392,7 @@ class StoreBackend(BackendProtocol):
             namespace: Hierarchical path prefix to search within.
             query: Optional query for natural language search.
             filter: Key-value pairs to filter results.
-            page_size: Number of items to fetch per page (default: 100).
+            page_size: Number of items to fetch per page.
 
         Returns:
             List of all items matching the search criteria.
@@ -328,6 +423,35 @@ class StoreBackend(BackendProtocol):
 
         return all_items
 
+    async def _asearch_store_paginated(
+        self,
+        store: BaseStore,
+        namespace: tuple[str, ...],
+        *,
+        query: str | None = None,
+        filter: dict[str, Any] | None = None,  # noqa: A002  # Matches LangGraph BaseStore.asearch() API
+        page_size: int = 100,
+    ) -> list[Item]:
+        """Async version of `_search_store_paginated`."""
+        all_items: list[Item] = []
+        offset = 0
+        while True:
+            page_items = await store.asearch(
+                namespace,
+                query=query,
+                filter=filter,
+                limit=page_size,
+                offset=offset,
+            )
+            if not page_items:
+                break
+            all_items.extend(page_items)
+            if len(page_items) < page_size:
+                break
+            offset += page_size
+
+        return all_items
+
     def ls(self, path: str) -> LsResult:
         """List files and directories in the specified directory (non-recursive).
 
@@ -335,8 +459,10 @@ class StoreBackend(BackendProtocol):
             path: Absolute path to directory.
 
         Returns:
-            List of FileInfo-like dicts for files and directories directly in the directory.
-            Directories have a trailing / in their path and is_dir=True.
+            List of `FileInfo`-like dicts for files and directories directly
+                in the directory.
+
+                Directories have a trailing `/` in their path and `is_dir=True`.
         """
         store = self._get_store()
         namespace = self._get_namespace()
@@ -402,8 +528,9 @@ class StoreBackend(BackendProtocol):
             limit: Maximum number of lines to read.
 
         Returns:
-            ReadResult with raw (unformatted) content for the requested
-            window. Line-number formatting is applied by the middleware.
+            `ReadResult` with raw (unformatted) content for the requested window.
+
+                Line-number formatting is applied by the middleware.
         """
         store = self._get_store()
         namespace = self._get_namespace()
@@ -441,7 +568,7 @@ class StoreBackend(BackendProtocol):
     ) -> ReadResult:
         """Async version of read using native store async methods.
 
-        This avoids sync calls in async context by using store.aget directly.
+        This avoids sync calls in async context by using `store.aget` directly.
         """
         store = self._get_store()
         namespace = self._get_namespace()
@@ -476,23 +603,22 @@ class StoreBackend(BackendProtocol):
         file_path: str,
         content: str,
     ) -> WriteResult:
-        """Create a new file with content.
+        """Write content to a file, creating it or overwriting it if it already exists.
 
-        Returns WriteResult. External storage sets files_update=None.
+        Returns `WriteResult` on success or error.
         """
         store = self._get_store()
         namespace = self._get_namespace()
 
-        # Check if file exists
         existing = store.get(namespace, file_path)
         if existing is not None:
-            return WriteResult(error=f"Cannot write to {file_path} because it already exists. Read and then make an edit, or write to a new path.")
-
-        # Create new file
-        file_data = create_file_data(content)
+            existing_file_data = self._convert_store_item_to_file_data(existing)
+            file_data = update_file_data(existing_file_data, content)
+        else:
+            file_data = create_file_data(content)
         store_value = self._convert_file_data_to_store_value(file_data)
         store.put(namespace, file_path, store_value)
-        return WriteResult(path=file_path, files_update=None)
+        return WriteResult(path=file_path)
 
     async def awrite(
         self,
@@ -501,21 +627,20 @@ class StoreBackend(BackendProtocol):
     ) -> WriteResult:
         """Async version of write using native store async methods.
 
-        This avoids sync calls in async context by using store.aget/aput directly.
+        This avoids sync calls in async context by using `store.aget`/`aput` directly.
         """
         store = self._get_store()
         namespace = self._get_namespace()
 
-        # Check if file exists using async method
         existing = await store.aget(namespace, file_path)
         if existing is not None:
-            return WriteResult(error=f"Cannot write to {file_path} because it already exists. Read and then make an edit, or write to a new path.")
-
-        # Create new file using async method
-        file_data = create_file_data(content)
+            existing_file_data = self._convert_store_item_to_file_data(existing)
+            file_data = update_file_data(existing_file_data, content)
+        else:
+            file_data = create_file_data(content)
         store_value = self._convert_file_data_to_store_value(file_data)
         await store.aput(namespace, file_path, store_value)
-        return WriteResult(path=file_path, files_update=None)
+        return WriteResult(path=file_path)
 
     def edit(
         self,
@@ -526,7 +651,7 @@ class StoreBackend(BackendProtocol):
     ) -> EditResult:
         """Edit a file by replacing string occurrences.
 
-        Returns EditResult. External storage sets files_update=None.
+        Returns `EditResult` on success or error.
         """
         store = self._get_store()
         namespace = self._get_namespace()
@@ -553,7 +678,7 @@ class StoreBackend(BackendProtocol):
         # Update file in store
         store_value = self._convert_file_data_to_store_value(new_file_data)
         store.put(namespace, file_path, store_value)
-        return EditResult(path=file_path, files_update=None, occurrences=int(occurrences))
+        return EditResult(path=file_path, occurrences=int(occurrences))
 
     async def aedit(
         self,
@@ -564,7 +689,7 @@ class StoreBackend(BackendProtocol):
     ) -> EditResult:
         """Async version of edit using native store async methods.
 
-        This avoids sync calls in async context by using store.aget/aput directly.
+        This avoids sync calls in async context by using `store.aget`/`aput` directly.
         """
         store = self._get_store()
         namespace = self._get_namespace()
@@ -591,7 +716,50 @@ class StoreBackend(BackendProtocol):
         # Update file in store using async method
         store_value = self._convert_file_data_to_store_value(new_file_data)
         await store.aput(namespace, file_path, store_value)
-        return EditResult(path=file_path, files_update=None, occurrences=int(occurrences))
+        return EditResult(path=file_path, occurrences=int(occurrences))
+
+    def delete(self, file_path: str) -> DeleteResult:
+        """Delete a file or directory from the store.
+
+        Deleting a path removes the exact key `file_path` plus every key nested
+        under it (the prefix `file_path` + "/"), so a directory is removed
+        recursively. Wildcards (e.g. `*`) in `file_path` are treated literally.
+
+        Args:
+            file_path: Path of the file or directory to delete.
+
+        Returns:
+            `DeleteResult` with `file_path` on success, or an error if no key is
+                stored at or under it.
+        """
+        store = self._get_store()
+        namespace = self._get_namespace()
+
+        items = self._search_store_paginated(store, namespace)
+        # A recursive delete removes the exact key plus everything nested under it.
+        base = file_path.rstrip("/")
+        prefix = base + "/"
+        to_delete = [key for item in items if (key := str(item.key)) == base or key.startswith(prefix)]
+        if not to_delete:
+            return DeleteResult(error=f"Error: File '{file_path}' not found")
+
+        store.batch([PutOp(namespace, key, None) for key in to_delete])
+        return DeleteResult(path=file_path)
+
+    async def adelete(self, file_path: str) -> DeleteResult:
+        """Async version of `delete` using native store async methods."""
+        store = self._get_store()
+        namespace = self._get_namespace()
+
+        items = await self._asearch_store_paginated(store, namespace)
+        base = file_path.rstrip("/")
+        prefix = base + "/"
+        to_delete = [key for item in items if (key := str(item.key)) == base or key.startswith(prefix)]
+        if not to_delete:
+            return DeleteResult(error=f"Error: File '{file_path}' not found")
+
+        await store.abatch([PutOp(namespace, key, None) for key in to_delete])
+        return DeleteResult(path=file_path)
 
     # Removed legacy grep() convenience to keep lean surface
 
@@ -613,7 +781,7 @@ class StoreBackend(BackendProtocol):
                 continue
         return grep_matches_from_files(files, pattern, path, glob)
 
-    def glob(self, pattern: str, path: str = "/") -> GlobResult:
+    def glob(self, pattern: str, path: str | None = None) -> GlobResult:
         """Find files matching a glob pattern in the store."""
         store = self._get_store()
         namespace = self._get_namespace()
@@ -654,11 +822,12 @@ class StoreBackend(BackendProtocol):
         Text files are stored as utf-8 strings.
 
         Args:
-            files: List of (path, content) tuples where content is bytes.
+            files: List of `(path, content)` tuples where content is bytes.
 
         Returns:
-            List of FileUploadResponse objects, one per input file.
-            Response order matches input order.
+            List of `FileUploadResponse` objects, one per input file.
+
+                Response order matches input order.
         """
         store = self._get_store()
         namespace = self._get_namespace()
@@ -687,8 +856,9 @@ class StoreBackend(BackendProtocol):
             paths: List of file paths to download.
 
         Returns:
-            List of FileDownloadResponse objects, one per input path.
-            Response order matches input order.
+            List of `FileDownloadResponse` objects, one per input path.
+
+                Response order matches input order.
         """
         store = self._get_store()
         namespace = self._get_namespace()

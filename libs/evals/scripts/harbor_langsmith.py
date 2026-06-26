@@ -6,6 +6,7 @@ lives in that module; this script only handles argument parsing.
 """
 
 import argparse
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -15,7 +16,7 @@ from dotenv import load_dotenv
 from deepagents_harbor.langsmith import (
     add_feedback,
     create_dataset,
-    create_experiment,
+    create_experiment_async,
     ensure_dataset,
 )
 
@@ -39,15 +40,15 @@ def main() -> int:
         help="Create a LangSmith dataset from Harbor tasks",
     )
     dataset_parser.add_argument(
-        "dataset_name",
+        "dataset_ref",
         type=str,
-        help="Dataset name (e.g., 'terminal-bench')",
+        help="Harbor dataset ref (e.g., 'terminal-bench/terminal-bench-2')",
     )
     dataset_parser.add_argument(
         "--version",
         type=str,
-        default="head",
-        help="Dataset version (default: 'head')",
+        default=None,
+        help="Deprecated. Include the version in dataset_ref instead.",
     )
     dataset_parser.add_argument(
         "--overwrite",
@@ -63,15 +64,15 @@ def main() -> int:
         help="Ensure a LangSmith dataset exists for Harbor tasks",
     )
     ensure_dataset_parser.add_argument(
-        "dataset_name",
+        "dataset_ref",
         type=str,
-        help="Dataset name (e.g., 'terminal-bench')",
+        help="Harbor dataset ref (e.g., 'terminal-bench/terminal-bench-2')",
     )
     ensure_dataset_parser.add_argument(
         "--version",
         type=str,
-        default="head",
-        help="Dataset version (default: 'head')",
+        default=None,
+        help="Deprecated. Include the version in dataset_ref instead.",
     )
     ensure_dataset_parser.add_argument(
         "--overwrite",
@@ -137,13 +138,13 @@ def main() -> int:
     # Route to appropriate command
     if args.command == "create-dataset":
         create_dataset(
-            dataset_name=args.dataset_name,
+            dataset_name=args.dataset_ref,
             version=args.version,
             overwrite=args.overwrite,
         )
     elif args.command == "ensure-dataset":
         ensure_dataset(
-            dataset_name=args.dataset_name,
+            dataset_name=args.dataset_ref,
             version=args.version,
             overwrite=args.overwrite,
         )
@@ -156,13 +157,27 @@ def main() -> int:
         if not isinstance(metadata, dict):
             print("Error: --metadata must be a JSON object.", file=sys.stderr)
             return 1
-        name = create_experiment(
-            dataset_name=args.dataset_name,
-            experiment_name=args.name,
-            model=args.model,
-            metadata={str(key): str(value) for key, value in metadata.items()},
-        )
+        try:
+            name, url = asyncio.run(
+                create_experiment_async(
+                    dataset_name=args.dataset_name,
+                    experiment_name=args.name,
+                    model=args.model,
+                    metadata={str(key): str(value) for key, value in metadata.items()},
+                )
+            )
+        except LookupError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        except (RuntimeError, OSError) as exc:
+            print(f"Error: failed to create experiment: {exc}", file=sys.stderr)
+            return 1
+        except Exception as exc:  # noqa: BLE001  # unexpected; distinct exit code
+            print(f"Error: unexpected failure creating experiment: {exc!r}", file=sys.stderr)
+            return 2
+        # stdout contract: exactly 2 lines (name, then url) — parsed by harbor.yml
         print(name)
+        print(url)
     elif args.command == "add-feedback":
         if not args.job_folder.exists():
             print(f"Error: Job folder does not exist: {args.job_folder}")
